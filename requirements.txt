@@ -9,7 +9,6 @@ scipy
 reportlab
 openai
 faster-whisper
-whisperx
 torch
 torchaudio
 ffmpeg-python
