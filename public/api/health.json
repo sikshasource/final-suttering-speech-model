@@ -1,0 +1,18 @@
+{
+  "status": "healthy",
+  "name": "ClinicalSpeech AI Edge Gateway",
+  "deployment": "Vercel Edge",
+  "version": "1.0.0",
+  "timestamp": "2026-11-02T14:00:00Z",
+  "architecture": {
+    "frontend": "Vercel Edge Platform",
+    "ml_engine": "Streamlit Python Core (faster-whisper + PyTorch + Librosa)",
+    "intake_pipeline_steps": 6,
+    "disfluency_categories_supported": 16
+  },
+  "endpoints": {
+    "portal": "/",
+    "health": "/api/health.json",
+    "cvret_standard": "v2.1"
+  }
+}

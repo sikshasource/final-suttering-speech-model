@@ -1,0 +1,31 @@
+# Python virtual environments & caches
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+
+# Heavy local AI models and cache (>1GB, not supported on Vercel)
+models/*
+!models/.gitkeep
+
+# Local databases and runtime outputs
+output/audio/*
+output/reports/*
+!output/audio/.gitkeep
+!output/reports/.gitkeep
+database/*.db
+database/*.sqlite3
+
+# Backend server specifications (kept for Streamlit Cloud and Render deployments)
+requirements.txt
+packages.txt
+render.yaml
+.python-version
+.devcontainer/
+
+# OS files
+.DS_Store
+Thumbs.db

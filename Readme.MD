@@ -404,3 +404,37 @@ At a high level:
 │ Transcripts          │  │                     │
 │ Observations         │  │ ReportLab           │
 └──────────────────────┘  └─────────────────────┘
+
+---
+
+## 🌐 Deployment Options
+
+### Option A: Deploy on Vercel (Edge Web Portal & Diagnostic Suite)
+The repository is fully configured for deployment on **Vercel** with zero-configuration edge hosting:
+1. Push this repository to GitHub.
+2. Go to [vercel.com](https://vercel.com/) and click **Add New** -> **Project**.
+3. Import your `final-suttering-speech-model` repository.
+4. Keep the default settings (Output Directory: `public`).
+5. Click **Deploy**.
+
+**What runs on Vercel:**
+- High-speed global edge clinical portal
+- Interactive Web Audio waveform and disfluency event inspector
+- Empirical SSI-4 severity rating calculator
+- CVRET clinical documentation viewer and PDF export
+- Health check API (`/api/health.json`)
+
+---
+
+### Option B: Deploy Streamlit ML Core (Streamlit Cloud or Render)
+For the full continuous Python runtime with local `faster-whisper`, `torch`, and acoustic DSP:
+
+#### 1. Streamlit Community Cloud (Recommended & Free)
+1. Push code to GitHub.
+2. Visit [share.streamlit.io](https://share.streamlit.io/) and log in with GitHub.
+3. Click **New app**, select this repository and set main file path to `app.py`.
+4. Click **Deploy**.
+
+#### 2. Render
+The repository includes `render.yaml` for 1-click web service deployment on Render with Python 3.11.9 and FFmpeg system packages.
+
