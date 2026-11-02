@@ -19,7 +19,11 @@ output/reports/*
 database/*.db
 database/*.sqlite3
 
-# Backend server specifications (kept for Streamlit Cloud and Render deployments)
+# Python application files & backend tests (run on Streamlit / Render, not on Vercel)
+app.py
+*.py
+tests/
+.streamlit/
 requirements.txt
 packages.txt
 render.yaml
