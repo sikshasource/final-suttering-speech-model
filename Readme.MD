@@ -405,6 +405,25 @@ At a high level:
 │ Observations         │  │ ReportLab           │
 └──────────────────────┘  └─────────────────────┘
 
+Register a patient under **Patients**, open **New Session**, and upload or record audio.
+After audio verification, click **Start Analysis** to save the session and run the existing
+pipeline automatically. Existing sessions can be processed or retried using the visible
+**Start Analysis / Re-run Analysis** button in **Analyze Session**.
+
+The default model remains Faster-Whisper `small` on CPU with `int8` computation.
+The first analysis requires internet access to download its existing model weights into
+`models/`; subsequent runs reuse them. No new model is required by these workflow fixes.
+
+The Vercel `public/` page is a static demonstration portal: its example waveform,
+transcripts, and metrics are not results from uploaded audio. Use the running Streamlit
+app for actual upload, transcription, detection, and reports. A static Vercel deployment
+alone cannot execute the Python analysis pipeline.
+
+To run the workflow regression checks (synthetic audio and stubbed transcription):
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 ---
 
 ## 🌐 Deployment Options
@@ -438,3 +457,34 @@ For the full continuous Python runtime with local `faster-whisper`, `torch`, and
 #### 2. Render
 The repository includes `render.yaml` for 1-click web service deployment on Render with Python 3.11.9 and FFmpeg system packages.
 
+---
+
+## 🔬 AI Engines & Dependencies
+- **Speech Transcription**: [faster-whisper](https://github.com/guillaumekln/faster-whisper)
+- **Acoustic Analysis**: [librosa](https://librosa.org/), [scipy](https://scipy.org/)
+- **Phoneme Alignment (Optional)**: [whisperx](https://github.com/m-bain/whisperX)
+- **Report Generation**: [reportlab](https://www.reportlab.com/)
+- **Transcript Disfluency Cleaning**: OpenAI GPT API (optional fallback to rule-based)
+
+---
+
+## 📄 License
+Research and clinical evaluation use.
+
+### Analysis performance
+
+The existing models, decoding options, pYIN parameters, event thresholds, and scoring
+formulas are unchanged. Decoded audio, acoustic features, repeated-sound features,
+and transcription are reused for identical inputs within the same Streamlit session.
+Each stage keeps at most two entries for ten minutes; no persistent/shared patient
+result cache is created. Transcription keys include the complete file digest, engine,
+model size, device, and compute type. Acoustic keys hash every normalized audio sample.
+Optional WhisperX model and alignment resources are also retained in memory.
+
+Use **Analysis settings → Recompute audio and transcription** to bypass stage reuse.
+The first run on a new recording still performs full inference and feature extraction,
+and may need model downloads and numerical-library warm-up.
+
+A local check on three seconds of synthetic audio measured warm acoustic extraction
+at 0.4104 seconds versus 0.000596 seconds for reuse. Every acoustic field matched
+exactly. This measures acoustic reuse only, not end-to-end speech transcription speed.

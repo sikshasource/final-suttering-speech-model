@@ -30,6 +30,8 @@ import uuid
 import base64
 import sqlite3
 import hashlib
+import time
+from html import escape
 import datetime as dt
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Tuple, Any
@@ -43,7 +45,6 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 
 import librosa
-import librosa.display
 import soundfile as sf
 
 # Optional heavy dependencies are imported lazily / defensively so the app
@@ -489,10 +490,32 @@ class AcousticFeatures:
     pitch_changes: List[Tuple[float, float]]
 
 
+def _session_memo(stage, key, compute, refresh=False):
+    """Small, session-private cache; never persist patient recordings to a shared cache."""
+    cache = st.session_state.setdefault("pipeline_memo", {})
+    entries = cache.setdefault(stage, {})
+    now = time.monotonic()
+    for old_key in list(entries):
+        if now - entries[old_key][0] > 600:
+            del entries[old_key]
+    if refresh or key not in entries:
+        value = compute()  # Exceptions are deliberately not cached.
+        if len(entries) >= 2:
+            del entries[next(iter(entries))]
+        entries[key] = (time.monotonic(), value)
+    return entries[key][1]
+
+
 def load_audio(path: str, target_sr: int = 16000) -> Tuple[np.ndarray, int]:
     """Load an audio file, mono, resampled to target_sr."""
-    y, sr = librosa.load(path, sr=target_sr, mono=True)
-    return y, sr
+    info = os.stat(path)
+    key = (os.path.abspath(path), info.st_size, info.st_mtime_ns, info.st_ctime_ns, target_sr)
+    def decode():
+        y, sr = librosa.load(path, sr=target_sr, mono=True)
+        if y.size == 0 or not np.all(np.isfinite(y)):
+            raise ValueError("Audio is empty or contains invalid samples. Please upload a valid recording.")
+        return y, sr
+    return _session_memo("decoded_audio", key, decode)
 
 
 def analyze_acoustics(y: np.ndarray, sr: int,
@@ -529,7 +552,7 @@ def analyze_acoustics(y: np.ndarray, sr: int,
 
     # --- Silence detection using dB threshold relative to signal peak ---
     rms_db = librosa.amplitude_to_db(rms + 1e-9, ref=np.max(rms) + 1e-9)
-    silence_mask = rms_db < -silence_db
+    silence_mask = np.ones_like(rms, dtype=bool) if np.max(np.abs(y)) < 1e-8 else rms_db < -silence_db
     silence_ratio = float(np.mean(silence_mask)) if len(silence_mask) else 0.0
 
     # --- Group silence frames into contiguous blocks (start, end) ---
@@ -699,7 +722,7 @@ def transcribe_audio(path: str, model_size: str = WHISPER_MODEL_SIZE,
     """
     model = load_whisper_model(model_size)
     if model is None:
-        return _fallback_empty_transcript()
+        raise RuntimeError("faster-whisper is unavailable. Install the project requirements and restart the app.")
 
     segments, info = model.transcribe(
         path, word_timestamps=True, language=language,
@@ -739,6 +762,16 @@ def transcribe_audio(path: str, model_size: str = WHISPER_MODEL_SIZE,
     }
 
 
+@st.cache_resource(show_spinner=False, max_entries=2)
+def load_whisperx_model(model_size, device, compute_type):
+    return whisperx.load_model(model_size, device, compute_type=compute_type, download_root=MODELS_DIR)
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def load_alignment_model(language, device):
+    return whisperx.load_align_model(language_code=language, device=device)
+
+
 def transcribe_audio_whisperx(path: str, model_size: str = WHISPER_MODEL_SIZE,
                                device: str = WHISPER_DEVICE) -> Dict:
     """Optional WhisperX path providing improved word-level alignment, used
@@ -746,13 +779,12 @@ def transcribe_audio_whisperx(path: str, model_size: str = WHISPER_MODEL_SIZE,
     if not WHISPERX_AVAILABLE:
         return transcribe_audio(path, model_size)
     try:
-        model = whisperx.load_model(model_size, device, compute_type=WHISPER_COMPUTE_TYPE,
-                                     download_root=MODELS_DIR)
+        model = load_whisperx_model(model_size, device, WHISPER_COMPUTE_TYPE)
         audio = whisperx.load_audio(path)
         result = model.transcribe(audio, batch_size=8)
         language = result.get("language", "en")
 
-        align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
+        align_model, metadata = load_alignment_model(language, device)
         aligned = whisperx.align(result["segments"], align_model, metadata, audio, device)
 
         words, sentences, full_text_parts = [], [], []
@@ -1015,7 +1047,8 @@ def merge_and_deduplicate_events(events: List[Dict], overlap_thresh: float = 0.5
 
 
 def run_full_event_detection(words: List[Dict], sentences: List[Dict],
-                              acoustic: "AcousticFeatures", y: np.ndarray, sr: int) -> List[Dict]:
+                              acoustic: "AcousticFeatures", y: np.ndarray, sr: int,
+                              acoustic_repeats=None) -> List[Dict]:
     """
     Orchestrates the full hybrid speech-event detection pipeline combining
     transcript-based linguistic disfluency detection with raw-audio acoustic
@@ -1032,7 +1065,8 @@ def run_full_event_detection(words: List[Dict], sentences: List[Dict],
 
     # Acoustic repeated-sound detection (independent of transcript quality)
     try:
-        acoustic_repeats = detect_repeated_sounds_acoustic(y, sr)
+        if acoustic_repeats is None:
+            acoustic_repeats = detect_repeated_sounds_acoustic(y, sr)
         for s, e in acoustic_repeats:
             events.append(_new_event("Sound Repetition", "[acoustic repeat]", s, e, 0.5,
                                       _duration_to_severity(e - s), source="acoustic"))
@@ -1530,635 +1564,9 @@ def configure_page():
     )
 
 
-CUSTOM_CSS = """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+with open(os.path.join(ASSETS_DIR, "workspace.css"), encoding="utf-8") as _stylesheet:
+    CUSTOM_CSS = "<style>" + _stylesheet.read() + "</style>"
 
-:root {
-    /* Color System Tokens */
-    --background: #0B132B;
-    --surface: #1C2541;
-    --surface-elevated: #243154;
-    --border: #324168;
-    --border-light: #2A3859;
-    --text-primary: #F8FAFC;
-    --text-secondary: #94A3B8;
-    --text-muted: #64748B;
-    
-    /* Primary & Accents */
-    --primary: #00A8E8;
-    --primary-hover: #38BDF8;
-    --primary-light: rgba(0, 168, 232, 0.15);
-    
-    /* Semantic Status Colors */
-    --success: #10B981;
-    --success-bg: rgba(16, 185, 129, 0.15);
-    --warning: #F59E0B;
-    --warning-bg: rgba(245, 158, 11, 0.15);
-    --danger: #EF4444;
-    --danger-bg: rgba(239, 68, 68, 0.15);
-    --info: #3B82F6;
-    --info-bg: rgba(59, 130, 246, 0.15);
-    --purple: #A855F7;
-    --purple-bg: rgba(168, 85, 247, 0.15);
-    --teal: #14B8A6;
-    --teal-bg: rgba(20, 184, 166, 0.15);
-
-    /* Typography & Spacing Scale (8px system) */
-    --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    --radius-sm: 4px;
-    --radius-md: 6px;
-    --radius-lg: 8px;
-    --radius-xl: 12px;
-}
-
-/* Global Application Viewport */
-html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
-    background-color: var(--background) !important;
-    color: var(--text-primary) !important;
-    font-family: var(--font-sans) !important;
-}
-
-/* Clean Header Overlay */
-[data-testid="stHeader"] {
-    background-color: rgba(11, 19, 43, 0.85) !important;
-    backdrop-filter: blur(8px) !important;
-}
-
-/* Sidebar Styling */
-[data-testid="stSidebar"] {
-    background-color: var(--surface) !important;
-    border-right: 1px solid var(--border) !important;
-}
-
-[data-testid="stSidebar"] * {
-    color: var(--text-primary) !important;
-}
-
-/* Hide Default Streamlit Chrome */
-#MainMenu, footer, header {
-    visibility: hidden;
-}
-
-/* Sidebar Top Branding Header Box */
-.cs-sidebar-brand-box {
-    padding: 12px 14px;
-    background-color: var(--surface-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    margin-bottom: 16px;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-
-.cs-brand-icon-wrapper {
-    font-size: 22px;
-    background-color: var(--primary-light);
-    border: 1px solid rgba(0, 168, 232, 0.3);
-    width: 38px;
-    height: 38px;
-    border-radius: var(--radius-md);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-}
-
-.cs-brand-title {
-    font-size: 15px;
-    font-weight: 700;
-    color: var(--text-primary);
-    line-height: 1.2;
-}
-
-.cs-brand-tagline {
-    font-size: 10px;
-    color: var(--text-muted);
-    margin-top: 2px;
-    line-height: 1.3;
-}
-
-/* Sidebar Navigation Items Override */
-[data-testid="stSidebar"] [data-testid="stRadio"] > div {
-    gap: 4px !important;
-}
-
-[data-testid="stSidebar"] [data-testid="stRadio"] label {
-    padding: 8px 12px !important;
-    border-radius: 6px !important;
-    border-left: 3px solid transparent !important;
-    transition: all 0.15s ease !important;
-    cursor: pointer !important;
-    background-color: transparent !important;
-}
-
-[data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
-    background-color: rgba(0, 168, 232, 0.08) !important;
-    color: var(--primary) !important;
-}
-
-[data-testid="stSidebar"] [data-testid="stRadio"] label[aria-checked="true"],
-[data-testid="stSidebar"] [data-testid="stRadio"] label[data-checked="true"] {
-    background-color: rgba(0, 168, 232, 0.14) !important;
-    border-left: 3px solid var(--primary) !important;
-    color: var(--text-primary) !important;
-    font-weight: 600 !important;
-}
-
-/* Hide Radio Bullet Circles in Navigation */
-[data-testid="stSidebar"] [data-testid="stRadio"] label > div:first-child {
-    display: none !important;
-}
-
-/* Sidebar Bottom Engine Status Panel */
-.cs-engine-panel {
-    background-color: var(--surface-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 12px 14px;
-    margin-top: 14px;
-}
-
-.cs-engine-panel-title {
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.8px;
-    color: var(--text-muted);
-    margin-bottom: 8px;
-    text-transform: uppercase;
-}
-
-.cs-engine-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 5px 0;
-    border-bottom: 1px solid var(--border-light);
-    font-size: 12px;
-}
-
-.cs-engine-row:last-child {
-    border-bottom: none;
-}
-
-.cs-engine-name {
-    color: var(--text-secondary);
-    font-weight: 500;
-}
-
-.cs-status-indicator {
-    font-size: 11px;
-    font-weight: 600;
-}
-
-.cs-status-indicator.online { color: #10B981; }
-.cs-status-indicator.optional { color: #3B82F6; }
-.cs-status-indicator.fallback { color: #F59E0B; }
-.cs-status-indicator.offline { color: #EF4444; }
-
-/* Global Top Header Bar Styling */
-.cs-top-header-left {
-    padding-bottom: 4px;
-}
-
-.cs-header-page-title {
-    font-size: 24px !important;
-    font-weight: 700 !important;
-    color: var(--text-primary) !important;
-    margin: 2px 0 4px 0 !important;
-    letter-spacing: -0.02em !important;
-}
-
-.cs-header-page-subtitle {
-    font-size: 13px;
-    color: var(--text-secondary);
-}
-
-.cs-top-header-right {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 12px;
-    padding-top: 4px;
-}
-
-.cs-user-profile {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    background-color: var(--surface-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    padding: 6px 12px;
-}
-
-.cs-user-avatar {
-    width: 32px;
-    height: 32px;
-    border-radius: 50%;
-    background-color: var(--primary);
-    color: #0B132B;
-    font-weight: 700;
-    font-size: 12px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.cs-user-info {
-    display: flex;
-    flex-direction: column;
-}
-
-.cs-user-name {
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-primary);
-    line-height: 1.2;
-}
-
-.cs-user-role {
-    font-size: 10px;
-    color: var(--text-muted);
-}
-
-.cs-header-icon-btn {
-    width: 36px;
-    height: 36px;
-    border-radius: var(--radius-md);
-    background-color: var(--surface-elevated);
-    border: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    font-size: 14px;
-    transition: all 0.2s ease;
-}
-
-.cs-header-icon-btn:hover {
-    border-color: var(--primary);
-    background-color: var(--primary-light);
-}
-
-/* Reusable UI Components */
-.cs-metric-card {
-    background-color: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    padding: 16px 18px;
-    margin-bottom: 12px;
-    position: relative;
-    overflow: hidden;
-    transition: transform 0.15s ease, border-color 0.15s ease;
-}
-
-.cs-metric-card:hover {
-    border-color: var(--primary);
-}
-
-.cs-metric-card::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 4px;
-    height: 100%;
-    background-color: var(--primary);
-}
-
-.cs-metric-card.success::before { background-color: var(--success); }
-.cs-metric-card.warning::before { background-color: var(--warning); }
-.cs-metric-card.danger::before { background-color: var(--danger); }
-.cs-metric-card.purple::before { background-color: var(--purple); }
-
-.cs-metric-label {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.6px;
-    color: var(--text-secondary);
-    margin-bottom: 4px;
-}
-
-.cs-metric-value {
-    font-size: 26px;
-    font-weight: 700;
-    color: var(--text-primary);
-    line-height: 1.2;
-}
-
-.cs-metric-subtext {
-    font-size: 11px;
-    color: var(--text-muted);
-    margin-top: 4px;
-}
-
-.cs-section-title {
-    font-size: 15px;
-    font-weight: 700;
-    color: var(--text-primary);
-    margin: 22px 0 12px 0;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    border-left: 3px solid var(--primary);
-    padding-left: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-
-.cs-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 12px;
-    border-radius: 9999px;
-    font-size: 12px;
-    font-weight: 600;
-    line-height: 1.3;
-}
-
-.cs-badge-primary { background-color: var(--primary-light); color: var(--primary); border: 1px solid rgba(0, 168, 232, 0.4); }
-.cs-badge-success { background-color: var(--success-bg); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.4); }
-.cs-badge-warning { background-color: var(--warning-bg); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.4); }
-.cs-badge-danger { background-color: var(--danger-bg); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.4); }
-.cs-badge-info { background-color: var(--info-bg); color: var(--info); border: 1px solid rgba(59, 130, 246, 0.4); }
-.cs-badge-purple { background-color: var(--purple-bg); color: var(--purple); border: 1px solid rgba(168, 85, 247, 0.4); }
-.cs-badge-teal { background-color: var(--teal-bg); color: var(--teal); border: 1px solid rgba(20, 184, 166, 0.4); }
-
-.severity-pill {
-    display: inline-block;
-    padding: 4px 12px;
-    border-radius: 9999px;
-    font-weight: 600;
-    font-size: 12px;
-    color: white;
-}
-
-.cs-sidebar-card {
-    background-color: var(--surface-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 10px 12px;
-    margin-bottom: 10px;
-    font-size: 12px;
-}
-
-.cs-sidebar-card h4 {
-    margin: 0 0 4px 0;
-    font-size: 12px;
-    color: var(--primary);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-
-/* Form Controls & Buttons Override */
-div.stButton > button {
-    background-color: var(--surface-elevated) !important;
-    color: var(--text-primary) !important;
-    border: 1px solid var(--border) !important;
-    border-radius: var(--radius-md) !important;
-    font-weight: 600 !important;
-    padding: 6px 16px !important;
-    transition: all 0.2s ease !important;
-}
-
-div.stButton > button:hover {
-    background-color: var(--primary-light) !important;
-    border-color: var(--primary) !important;
-    color: var(--primary) !important;
-}
-
-div.stButton > button[kind="primary"] {
-    background-color: var(--primary) !important;
-    color: #0B132B !important;
-    border: none !important;
-    font-weight: 700 !important;
-}
-
-div.stButton > button[kind="primary"]:hover {
-    background-color: var(--primary-hover) !important;
-    color: #0B132B !important;
-    box-shadow: 0 0 12px rgba(0, 168, 232, 0.4) !important;
-}
-
-/* Inputs, Selectboxes, Textareas */
-[data-baseweb="input"], [data-baseweb="select"], [data-baseweb="textarea"] {
-    background-color: var(--surface-elevated) !important;
-    border-color: var(--border) !important;
-    color: var(--text-primary) !important;
-    border-radius: var(--radius-md) !important;
-}
-
-/* Dataframe styling */
-[data-testid="stDataFrame"] {
-    border: 1px solid var(--border) !important;
-    border-radius: var(--radius-md) !important;
-    background-color: var(--surface) !important;
-}
-
-/* Tabs */
-[data-baseweb="tab-list"] {
-    background-color: var(--surface) !important;
-    border-bottom: 1px solid var(--border) !important;
-    gap: 8px !important;
-}
-
-[data-baseweb="tab"] {
-    color: var(--text-secondary) !important;
-    font-weight: 600 !important;
-}
-
-[aria-selected="true"] {
-    color: var(--primary) !important;
-    border-bottom: 2px solid var(--primary) !important;
-}
-
-/* Audio Player */
-audio {
-    width: 100%;
-    border-radius: var(--radius-md);
-    filter: invert(0.9) hue-rotate(180deg);
-}
-
-/* Empty State Box */
-.cs-empty-state {
-    background-color: var(--surface);
-    border: 1px dashed var(--border);
-    border-radius: var(--radius-lg);
-    padding: 32px 20px;
-    text-align: center;
-    color: var(--text-secondary);
-}
-
-.cs-empty-state h4 {
-    color: var(--text-primary);
-    font-size: 15px;
-    margin: 10px 0 4px 0;
-}
-
-/* ==============================================================================
- * RESPONSIVE BREAKPOINTS (Desktop, Tablet, Mobile)
- * ============================================================================== */
-
-/* Desktop Large (1440px+) */
-@media (min-width: 1440px) {
-    .cs-top-header-left { padding-right: 24px; }
-    .cs-metric-value { font-size: 28px !important; }
-}
-
-/* Desktop Medium & Laptops (1024px - 1439px) */
-@media (min-width: 1024px) and (max-width: 1439px) {
-    .cs-metric-value { font-size: 24px !important; }
-    .cs-section-title { font-size: 14px !important; }
-}
-
-/* Tablet (768px - 1023px) */
-@media (max-width: 1023px) {
-    [data-testid="stSidebar"] {
-        min-width: 240px !important;
-        max-width: 280px !important;
-    }
-    
-    .cs-header-page-title {
-        font-size: 20px !important;
-    }
-    
-    .cs-metric-value {
-        font-size: 22px !important;
-    }
-    
-    .element-container:has(.stDataFrame), [data-testid="stTable"] {
-        overflow-x: auto !important;
-        -webkit-overflow-scrolling: touch !important;
-    }
-
-    [data-testid="column"] {
-        min-width: 45% !important;
-        flex: 1 1 45% !important;
-        margin-bottom: 8px !important;
-    }
-}
-
-/* Mobile Devices (320px - 767px) */
-@media (max-width: 767px) {
-    [data-testid="stSidebar"] {
-        width: 100% !important;
-    }
-
-    .cs-top-header-left {
-        width: 100% !important;
-        text-align: left;
-    }
-
-    .cs-header-page-title {
-        font-size: 18px !important;
-    }
-
-    .cs-header-page-subtitle {
-        font-size: 11px !important;
-    }
-
-    [data-testid="column"] {
-        min-width: 100% !important;
-        flex: 1 1 100% !important;
-        margin-bottom: 12px !important;
-    }
-
-    .js-plotly-plot, .plot-container {
-        width: 100% !important;
-        overflow-x: auto !important;
-    }
-
-    .cs-metric-card {
-        padding: 12px 14px !important;
-    }
-
-    .cs-metric-value {
-        font-size: 20px !important;
-    }
-
-    audio {
-        width: 100% !important;
-    }
-
-    [data-testid="stTabs"] [data-baseweb="tab-list"] {
-        overflow-x: auto !important;
-        white-space: nowrap !important;
-        flex-wrap: nowrap !important;
-    }
-}
-
-/* ==============================================================================
- * CLINICAL MICRO-INTERACTIONS (150ms - 250ms Restrained State Motion)
- * ============================================================================== */
-
-/* Micro-interaction timing tokens */
-:root {
-    --motion-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
-    --motion-normal: 200ms cubic-bezier(0.4, 0, 0.2, 1);
-    --motion-slow: 250ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-/* Card hover feedback */
-.cs-metric-card, .cs-sidebar-card, .cs-empty-state {
-    transition: transform var(--motion-normal), border-color var(--motion-normal), box-shadow var(--motion-normal) !important;
-}
-
-.cs-metric-card:hover {
-    transform: translateY(-2px);
-    border-color: var(--primary) !important;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
-}
-
-/* Button micro-interactions */
-div.stButton > button {
-    transition: background-color var(--motion-fast), border-color var(--motion-fast), transform var(--motion-fast) !important;
-}
-
-div.stButton > button:active {
-    transform: scale(0.98);
-}
-
-/* Input focus transitions */
-[data-baseweb="input"], [data-baseweb="select"], [data-baseweb="textarea"] {
-    transition: border-color var(--motion-fast), box-shadow var(--motion-fast) !important;
-}
-
-/* Tab indicator & badge transitions */
-[data-baseweb="tab"] {
-    transition: color var(--motion-fast), border-color var(--motion-fast) !important;
-}
-
-/* Chart container fade entrance */
-.js-plotly-plot {
-    animation: csFadeIn var(--motion-slow);
-}
-
-@keyframes csFadeIn {
-    from { opacity: 0; transform: translateY(4px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-
-/* Respect user system prefers-reduced-motion settings */
-@media (prefers-reduced-motion: reduce) {
-    *, ::before, ::after {
-        animation-duration: 0.01ms !important;
-        animation-iteration-count: 1 !important;
-        transition-duration: 0.01ms !important;
-        scroll-behavior: auto !important;
-    }
-    .cs-metric-card:hover {
-        transform: none !important;
-    }
-    div.stButton > button:active {
-        transform: none !important;
-    }
-}
-</style>
-"""
 
 SEVERITY_COLOR_MAP = {
     "Normal": "#10B981",
@@ -2202,35 +1610,22 @@ def render_header(title_or_subtitle: str = "", subtitle: str = ""):
     with col_hdr_left:
         st.markdown(f"""
         <div class="cs-top-header-left">
-            <div class="cs-breadcrumb">CLINICALSPEECH AI &nbsp;/&nbsp; WORKSPACE &nbsp;/&nbsp; {page_name.upper()}</div>
-            <h1 class="cs-header-page-title">{page_name}</h1>
-            <div class="cs-header-page-subtitle">{desc}</div>
+            <div class="cs-breadcrumb">WORKSPACE &nbsp;/&nbsp; {escape(page_name.upper())}</div>
+            <h1 class="cs-header-page-title">{escape(page_name)}</h1>
+            <div class="cs-header-page-subtitle">{escape(desc)}</div>
         </div>
         """, unsafe_allow_html=True)
         
     with col_hdr_right:
-        st.markdown(f"""
-        <div class="cs-top-header-right">
-            <div class="cs-user-profile">
-                <div class="cs-user-avatar">NR</div>
-                <div class="cs-user-info">
-                    <div class="cs-user-name">Nachiketa NR</div>
-                    <div class="cs-user-role">SLP / Research</div>
-                </div>
-            </div>
-            <div class="cs-header-icon-btn" title="Notifications">🔔</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Shortcut action button to create a new session if not currently on New Session page
-        if st.session_state.get("nav_page") != "New Session":
-            if st.button("➕ New Session", key=f"hdr_btn_{uuid.uuid4().hex[:6]}", type="primary"):
+        st.markdown('<div class="cs-workspace-label">Speech fluency · Clinical workspace</div>', unsafe_allow_html=True)
+        if page_name not in {"New Session", "Dashboard", "Patients"}:
+            if st.button("New session", key="header_new_session", type="secondary", use_container_width=True):
                 st.session_state.nav_page = "New Session"
                 st.rerun()
 
 
 def metric_card(col, label: str, value: Any, suffix: str = "", subtext: str = "", variant: str = "primary"):
-    """Renders a clinical metric card adhering to the dark navy design system."""
+    """Renders a clinical metric card adhering to the workspace design system."""
     col.markdown(f"""
     <div class="cs-metric-card {variant}">
         <div class="cs-metric-label">{label}</div>
@@ -2270,7 +1665,7 @@ def render_empty_state(icon: str, title: str, description: str, action_label: Op
     """
     st.markdown(f"""
     <div class="cs-empty-state" style="background-color: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 32px; text-align: center; margin: 16px 0;">
-        <div style="font-size: 40px; margin-bottom: 12px;">{icon}</div>
+        <div class="cs-empty-icon" aria-hidden="true">◇</div>
         <h4 style="color: var(--text-primary); margin: 0 0 8px 0; font-size: 18px;">{title}</h4>
         <p style="font-size: 13px; color: var(--text-secondary); max-width: 500px; margin: 0 auto 16px auto; line-height: 1.5;">{description}</p>
     </div>
@@ -2381,12 +1776,12 @@ def apply_clinical_chart_theme(fig, height: int = 380, title: str = None):
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(28,37,65,0.4)",
+        plot_bgcolor="rgba(20,30,40,0.4)",
         font=dict(family="Inter, sans-serif", color="#F8FAFC", size=11),
         height=height,
         margin=dict(l=20, r=20, t=40 if title else 20, b=30),
-        xaxis=dict(gridcolor="#324168", zerolinecolor="#324168"),
-        yaxis=dict(gridcolor="#324168", zerolinecolor="#324168"),
+        xaxis=dict(gridcolor="#2b3947", zerolinecolor="#2b3947"),
+        yaxis=dict(gridcolor="#2b3947", zerolinecolor="#2b3947"),
     )
     if title:
         fig.update_layout(title=dict(text=title, font=dict(size=14, color="#F8FAFC")))
@@ -2400,10 +1795,10 @@ def render_sidebar():
     # Sidebar Top Branding Header Box
     st.sidebar.markdown(f"""
     <div class="cs-sidebar-brand-box">
-        <div class="cs-brand-icon-wrapper">🗣️</div>
+        <div class="cs-brand-icon-wrapper" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 10v4m4-7v10m4-13v16m4-13v10m4-7v4"/></svg></div>
         <div class="cs-brand-details">
             <div class="cs-brand-title">ClinicalSpeech AI</div>
-            <div class="cs-brand-tagline">Comprehensive Speech Fluency & Stuttering Event Analysis</div>
+            <div class="cs-brand-tagline">Speech fluency workspace</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -2413,15 +1808,10 @@ def render_sidebar():
         "Timeline", "Segmentation", "Statistics", "Clinical Report",
         "Patient History & Compare",
     ]
-    icons = {
-        "Dashboard": "🏠", "Patients": "🧑‍⚕️", "New Session": "🎙️",
-        "Analyze Session": "🔬", "Timeline": "📈", "Segmentation": "🧩",
-        "Statistics": "📊", "Clinical Report": "📄",
-        "Patient History & Compare": "🕓",
-    }
+    st.sidebar.markdown('<div class="cs-nav-label">WORKSPACE</div>', unsafe_allow_html=True)
     choice = st.sidebar.radio(
         "Navigation", pages,
-        format_func=lambda p: f"{icons.get(p,'')}  {p}",
+        format_func=lambda p: p,
         index=pages.index(st.session_state.nav_page) if st.session_state.nav_page in pages else 0,
         label_visibility="collapsed",
     )
@@ -2457,13 +1847,13 @@ def render_sidebar():
     st.sidebar.markdown("---")
     
     fw_class = "online" if FASTER_WHISPER_AVAILABLE else "offline"
-    fw_text = "Online" if FASTER_WHISPER_AVAILABLE else "Offline"
+    fw_text = "Installed" if FASTER_WHISPER_AVAILABLE else "Offline"
     
     wx_class = "online" if WHISPERX_AVAILABLE else "optional"
-    wx_text = "Online" if WHISPERX_AVAILABLE else "Optional"
+    wx_text = "Installed" if WHISPERX_AVAILABLE else "Optional"
     
     pdf_class = "online" if REPORTLAB_AVAILABLE else "offline"
-    pdf_text = "Online" if REPORTLAB_AVAILABLE else "Offline"
+    pdf_text = "Available" if REPORTLAB_AVAILABLE else "Offline"
     
     gpt_class = "online" if GPT_API_KEY else "fallback"
     gpt_text = "API Ready" if GPT_API_KEY else "Rule-based fallback"
@@ -2498,7 +1888,7 @@ def render_sidebar():
 # SECTION 12: PAGE - DASHBOARD
 # ==============================================================================
 def page_dashboard():
-    render_header("Dashboard", "Comprehensive Speech Fluency & Stuttering Event Analysis")
+    render_header("Dashboard", "An overview of your patients, speech sessions, and analysis results.")
     
     patients = db_get_patients()
     sessions = db_get_sessions()
@@ -2508,6 +1898,32 @@ def page_dashboard():
     completed_count = int((sessions["status"] == "completed").sum()) if not sessions.empty else 0
     pending_count = total_sessions_count - completed_count
     
+    if sessions.empty:
+        with st.container(border=True):
+            st.markdown("### Start your first speech assessment")
+            st.caption("Follow these three steps to turn a recording into a saved analysis.")
+            steps = st.columns(3)
+            for col, number, title, detail in zip(
+                steps, ["01", "02", "03"],
+                ["Choose a patient", "Add a recording", "Review the results"],
+                ["Create a patient profile to keep sessions together.",
+                 "Upload audio or record speech in a new session.",
+                 "Explore fluency metrics, transcripts, and the report."]):
+                with col:
+                    st.markdown(f'<div class="cs-workflow-card"><span>{number}</span><h4>{title}</h4><p>{detail}</p></div>', unsafe_allow_html=True)
+            action, _ = st.columns([1, 2])
+            if action.button("Register first patient" if patients.empty else "Create a session",
+                             key="dash_empty_cta", type="primary", use_container_width=True):
+                st.session_state.nav_page = "Patients" if patients.empty else "New Session"
+                st.rerun()
+        return
+
+    action_intro, action_button = st.columns([3, 1], vertical_alignment="bottom")
+    action_intro.caption("WORKSPACE OVERVIEW")
+    if action_button.button("New session", key="dashboard_new_session", type="primary", use_container_width=True):
+        st.session_state.nav_page = "New Session"
+        st.rerun()
+
     # --- 1. KPI Metric Area ---
     c1, c2, c3, c4 = st.columns(4)
     
@@ -2528,7 +1944,7 @@ def page_dashboard():
     )
     metric_card(
         c4, "Pending Analyses", pending_count,
-        subtext="Awaiting pipeline run" if pending_count > 0 else "All sessions analyzed",
+        subtext="Ready for analysis" if pending_count > 0 else ("All sessions analyzed" if total_sessions_count else "No sessions awaiting analysis"),
         variant="warning" if pending_count > 0 else "primary"
     )
     
@@ -2537,7 +1953,7 @@ def page_dashboard():
     # --- 2. Main Dashboard Split: Recent Sessions Data Table & Severity Donut ---
     col_main, col_donut = st.columns([2.2, 1.0])
     
-    with col_main:
+    with col_main, st.container(border=True):
         st.markdown("""
         <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 8px;">
             <div>
@@ -2550,13 +1966,13 @@ def page_dashboard():
         if sessions.empty:
             st.markdown("""
             <div class="cs-empty-state">
-                <div style="font-size: 36px; margin-bottom: 8px;">🎙️</div>
+                <div class="cs-empty-icon" aria-hidden="true">≋</div>
                 <h4 style="margin: 0 0 6px 0;">No sessions yet</h4>
-                <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 16px;">Go to New Session to upload or record patient audio.</p>
+                <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 16px;">Start with a patient profile, then upload or record a speech sample.</p>
             </div>
             """, unsafe_allow_html=True)
-            if st.button("➕ New Session", key="dash_empty_cta", type="primary"):
-                st.session_state.nav_page = "New Session"
+            if st.button("Register first patient" if patients.empty else "Create a session", key="dash_empty_cta", type="primary"):
+                st.session_state.nav_page = "Patients" if patients.empty else "New Session"
                 st.rerun()
         else:
             merged = sessions.merge(patients[["id", "name", "patient_code"]],
@@ -2591,7 +2007,7 @@ def page_dashboard():
             df_formatted = pd.DataFrame(formatted_rows)
             st.dataframe(df_formatted, use_container_width=True, hide_index=True)
             
-    with col_donut:
+    with col_donut, st.container(border=True):
         st.markdown("""
         <div>
             <div class="cs-section-title" style="margin: 0;">Severity Distribution</div>
@@ -2620,9 +2036,9 @@ def page_dashboard():
                 fig_donut.update_layout(showlegend=False, margin=dict(l=10, r=10, t=10, b=10))
                 st.plotly_chart(fig_donut, use_container_width=True)
             else:
-                render_empty_state("📊", "0 Sessions", "No analyzed sessions available to calculate severity distribution.")
+                render_empty_state("📊", "No results yet", "No analyzed sessions available to calculate severity distribution.")
         else:
-            render_empty_state("📊", "0 Sessions", "No analyzed sessions available to calculate severity distribution.")
+            render_empty_state("📊", "No results yet", "No analyzed sessions available to calculate severity distribution.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -2691,7 +2107,10 @@ def _get_patient_initials(name: str) -> str:
 def page_patients():
     render_header("Patients", "Manage patient profiles, speech sessions, and clinical history.")
     
-    tab_directory, tab_register = st.tabs(["📋 Clinical Patient Directory", "➕ Register New Patient"])
+    if db_get_patients().empty:
+        tab_register, tab_directory = st.tabs(["Register patient", "Patient directory"])
+    else:
+        tab_directory, tab_register = st.tabs(["Patient directory", "Register patient"])
     
     with tab_register:
         st.markdown("""
@@ -2854,15 +2273,21 @@ def page_patients():
 # SECTION 14: PAGE - NEW SESSION (Guided 4-Step Intake Workflow)
 # ==============================================================================
 def _save_uploaded_audio(file_bytes: bytes, suffix: str = ".wav") -> str:
-    fname = f"audio_{uuid.uuid4().hex[:10]}{suffix}"
+    if not file_bytes:
+        raise ValueError("The uploaded audio file is empty.")
+    suffix = suffix.lower()
+    if suffix not in {".wav", ".mp3", ".m4a", ".flac", ".ogg"}:
+        raise ValueError("Unsupported audio format.")
+    fname = f"audio_{hashlib.sha256(file_bytes).hexdigest()}{suffix}"
     path = os.path.join(AUDIO_STORE_DIR, fname)
-    with open(path, "wb") as f:
-        f.write(file_bytes)
+    if not os.path.exists(path):
+        with open(path, "wb") as f:
+            f.write(file_bytes)
     return path
 
 
 def page_new_session():
-    render_header("New Session", "Guided Clinical Intake & Audio Recording Workflow")
+    render_header("New Session", "Select a patient, add a recording, and start a speech fluency analysis.")
 
     patients = db_get_patients()
     if patients.empty:
@@ -2879,106 +2304,119 @@ def page_new_session():
         return
 
     st.markdown("""
-    <div style="display: flex; gap: 12px; margin-bottom: 20px;">
-        <div class="cs-badge cs-badge-primary">STEP 1: Patient Selection</div>
-        <div class="cs-badge cs-badge-teal">STEP 2: Session Details</div>
-        <div class="cs-badge cs-badge-info">STEP 3: Audio Input</div>
-        <div class="cs-badge cs-badge-purple">STEP 4: Review & Save</div>
+    <div class="cs-intake-steps" aria-label="Session creation steps">
+        <div class="cs-intake-step"><span class="cs-step-number">1</span> Patient</div>
+        <div class="cs-intake-step"><span class="cs-step-number">2</span> Session details</div>
+        <div class="cs-intake-step"><span class="cs-step-number">3</span> Audio recording</div>
+        <div class="cs-intake-step"><span class="cs-step-number">4</span> Review &amp; analyze</div>
     </div>
     """, unsafe_allow_html=True)
 
-    # --- STEP 1: Select Patient ---
-    st.markdown('<div class="cs-section-title">Step 1 — Patient Selection</div>', unsafe_allow_html=True)
-    col_p_select, col_p_add = st.columns([3, 1])
-    
-    patient_labels = [f"{r['name']} ({r['patient_code']}) — Age {r['age']}" for _, r in patients.iterrows()]
-    default_idx = 0
-    if st.session_state.current_patient_id:
-        ids = patients["id"].tolist()
-        if st.session_state.current_patient_id in ids:
-            default_idx = ids.index(st.session_state.current_patient_id)
-            
-    sel_label = col_p_select.selectbox("Select Patient Profile *", patient_labels, index=default_idx)
-    patient_id = int(patients.iloc[patient_labels.index(sel_label)]["id"])
-    st.session_state.current_patient_id = patient_id
-    
-    if col_p_add.button("➕ Add New Patient"):
-        st.session_state.nav_page = "Patients"
-        st.rerun()
-        
-    p_info = db_get_patient(patient_id)
-    if p_info:
-        st.markdown(f"""
-        <div class="cs-sidebar-card" style="margin-top: 6px;">
-            <strong style="color: var(--text-primary);">{p_info['name']}</strong> &nbsp;|&nbsp; 
-            <span style="color: var(--primary);">{p_info['patient_code']}</span> &nbsp;|&nbsp; 
-            Age: {p_info['age']} ({p_info['gender']}) &nbsp;|&nbsp; 
-            Doctor: {p_info['referring_doctor'] or 'Self-referred'}
-        </div>
-        """, unsafe_allow_html=True)
+    with st.container(border=True):
+        # --- STEP 1: Select Patient ---
+        st.markdown('<div class="cs-section-title">01 / Patient</div>', unsafe_allow_html=True)
+        col_p_select, col_p_add = st.columns([3, 1], vertical_alignment="bottom")
 
-    # --- STEP 2: Session Details ---
-    st.markdown('<div class="cs-section-title">Step 2 — Session Metadata</div>', unsafe_allow_html=True)
-    c_s1, c_s2 = st.columns(2)
-    session_label = c_s1.text_input("Session Title / Label *", value=f"Fluency Assessment {now_iso()[:10]}")
-    session_notes = c_s2.text_input("Intake Notes / Context", placeholder="e.g. Baseline reading task, spontaneous conversation...")
+        patient_labels = [f"{r['name']} ({r['patient_code']}) — Age {r['age']}" for _, r in patients.iterrows()]
+        default_idx = 0
+        if st.session_state.current_patient_id:
+            ids = patients["id"].tolist()
+            if st.session_state.current_patient_id in ids:
+                default_idx = ids.index(st.session_state.current_patient_id)
 
-    # --- STEP 3: Audio Provisioning ---
-    st.markdown('<div class="cs-section-title">Step 3 — Provide Speech Audio</div>', unsafe_allow_html=True)
-    mode = st.radio("Audio Provision Method", ["📁 Upload Audio File (WAV, MP3, M4A, FLAC, OGG)", "🎙️ Record Live Audio"], horizontal=True)
+        sel_label = col_p_select.selectbox("Select Patient Profile *", patient_labels, index=default_idx)
+        patient_id = int(patients.iloc[patient_labels.index(sel_label)]["id"])
+        st.session_state.current_patient_id = patient_id
 
-    audio_path = None
-    duration = None
-    sr = None
+        if col_p_add.button("Add patient", use_container_width=True):
+            st.session_state.nav_page = "Patients"
+            st.rerun()
 
-    if "Upload Audio" in mode:
-        uploaded = st.file_uploader("Drag & drop patient speech recording file here", type=["wav", "mp3", "m4a", "flac", "ogg"])
-        if uploaded is not None:
-            suffix = os.path.splitext(uploaded.name)[1] or ".wav"
-            audio_path = _save_uploaded_audio(uploaded.read(), suffix)
-            st.audio(audio_path)
-    else:
-        try:
-            rec = st.audio_input("Record patient speech live")
-        except AttributeError:
-            rec = None
-            st.error("Your Streamlit version does not support st.audio_input. Please use file upload instead.")
-        if rec is not None:
-            audio_path = _save_uploaded_audio(rec.read(), ".wav")
-            st.audio(audio_path)
-
-    if audio_path:
-        try:
-            y, sr = load_audio(audio_path)
-            duration = float(len(y) / sr)
-            
-            # --- STEP 4: Review & Action ---
-            st.markdown('<div class="cs-section-title">Step 4 — Review & Proceed</div>', unsafe_allow_html=True)
-            
+        p_info = db_get_patient(patient_id)
+        if p_info:
             st.markdown(f"""
-            <div class="cs-sidebar-card">
-                <strong>Audio Verification Summary:</strong><br>
-                Duration: <strong style="color: var(--primary);">{duration:.1f} seconds</strong> | Sample Rate: {sr} Hz | File: {os.path.basename(audio_path)}
+            <div class="cs-sidebar-card" style="margin-top: 6px;">
+                <strong style="color: var(--text-primary);">{p_info['name']}</strong> &nbsp;|&nbsp;
+                <span style="color: var(--primary);">{p_info['patient_code']}</span> &nbsp;|&nbsp;
+                Age: {p_info['age']} ({p_info['gender']}) &nbsp;|&nbsp;
+                Doctor: {p_info['referring_doctor'] or 'Self-referred'}
             </div>
             """, unsafe_allow_html=True)
 
-            if st.button("💾 Save Session & Proceed to Pipeline Analysis 🔬", type="primary"):
-                session_id = db_create_session(patient_id, session_label, audio_path, duration, sr)
-                st.session_state.current_session_id = session_id
-                st.success(f"Session #{session_id} saved successfully! Directing to pipeline execution...")
-                st.session_state.nav_page = "Analyze Session"
-                st.rerun()
-        except Exception as e:
-            st.error(f"Could not read audio file: {e}")
+        # --- STEP 2: Session Details ---
+        st.markdown('<div class="cs-section-title">02 / Session details</div>', unsafe_allow_html=True)
+        c_s1, c_s2 = st.columns(2)
+        session_label = c_s1.text_input("Session Title / Label *", value=f"Fluency Assessment {now_iso()[:10]}")
+        session_notes = c_s2.text_input("Intake Notes / Context", placeholder="e.g. Baseline reading task, spontaneous conversation...")
+
+    with st.container(border=True):
+        # --- STEP 3: Audio Provisioning ---
+        st.markdown('<div class="cs-section-title">03 / Audio recording</div>', unsafe_allow_html=True)
+        mode = st.radio("Audio Provision Method", ["📁 Upload Audio File (WAV, MP3, M4A, FLAC, OGG)", "🎙️ Record Live Audio"], horizontal=True)
+
+        audio_path = None
+        duration = None
+        sr = None
+
+        st.caption("Use a clear recording with one speaker. Supported formats: WAV, MP3, M4A, FLAC, and OGG.")
+        if "Upload Audio" in mode:
+            uploaded = st.file_uploader("Upload a speech recording", type=["wav", "mp3", "m4a", "flac", "ogg"])
+            if uploaded is not None:
+                suffix = os.path.splitext(uploaded.name)[1] or ".wav"
+                audio_path = _save_uploaded_audio(uploaded.getvalue(), suffix)
+                st.audio(audio_path)
+        else:
+            try:
+                rec = st.audio_input("Record patient speech live")
+            except AttributeError:
+                rec = None
+                st.error("Your Streamlit version does not support st.audio_input. Please use file upload instead.")
+            if rec is not None:
+                audio_path = _save_uploaded_audio(rec.getvalue(), ".wav")
+                st.audio(audio_path)
+
+        if audio_path:
+            try:
+                verified = st.session_state.get("verified_audio")
+                if not verified or verified["path"] != audio_path:
+                    y, sr = load_audio(audio_path)
+                    verified = {"path": audio_path, "sr": sr, "duration": float(len(y) / sr)}
+                    st.session_state.verified_audio = verified
+                sr, duration = verified["sr"], verified["duration"]
+
+                # --- STEP 4: Review & Action ---
+                st.markdown('<div class="cs-section-title">04 / Ready to analyze</div>', unsafe_allow_html=True)
+
+                st.markdown(f"""
+                <div class="cs-review">
+                    <div class="cs-review-title">Recording verified</div>
+                    <div class="cs-review-meta">{duration:.1f} seconds &nbsp;·&nbsp; {sr:,} Hz &nbsp;·&nbsp; Mono audio<br>
+                    Start analysis to save this session and process the recording.</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                if not FASTER_WHISPER_AVAILABLE:
+                    st.error("Install the project requirements and restart the app to enable analysis.")
+                if st.button("🔬 Start Analysis", type="primary", use_container_width=True,
+                             disabled=not FASTER_WHISPER_AVAILABLE or not session_label.strip()):
+                    session_id = db_create_session(patient_id, session_label, audio_path, duration, sr)
+                    st.session_state.current_session_id = session_id
+                    st.session_state.pending_analysis_id = session_id
+                    st.session_state.nav_page = "Analyze Session"
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Could not read audio file: {e}")
 
 
 # ==============================================================================
 # SECTION 15: PAGE - ANALYZE SESSION (Step 5 Processing & Step 6 Completion)
 # ==============================================================================
 def run_full_analysis_pipeline(session_id: int, whisper_size: str = WHISPER_MODEL_SIZE,
-                                use_whisperx: bool = False, progress_cb=None) -> Dict:
+                                use_whisperx: bool = False, progress_cb=None, refresh=False) -> Dict:
     """Runs the complete analysis pipeline for a session and persists all results."""
     session = db_get_session(session_id)
+    if session is None:
+        raise ValueError("The selected session no longer exists.")
     audio_path = session["audio_path"]
 
     def report(pct, msg):
@@ -2989,8 +2427,10 @@ def run_full_analysis_pipeline(session_id: int, whisper_size: str = WHISPER_MODE
     y, sr = load_audio(audio_path)
     duration = float(len(y) / sr)
 
-    report(15, "Running acoustic feature extraction (RMS energy, pYIN pitch, silence ratios)...")
-    acoustic = analyze_acoustics(y, sr)
+    # Hash every sample: Streamlit's default large-array sampling is not used.
+    audio_key = (hashlib.sha256(y.tobytes()).hexdigest(), sr)
+    report(15, "Extracting acoustic features (reusing identical audio when available)...")
+    acoustic = _session_memo("acoustics", audio_key, lambda: analyze_acoustics(y, sr), refresh)
     db_save_audio_metadata(session_id, {
         "duration": duration, "sample_rate": sr, "channels": 1,
         "rms_mean": float(np.mean(acoustic.rms)), "rms_std": float(np.std(acoustic.rms)),
@@ -3001,15 +2441,31 @@ def run_full_analysis_pipeline(session_id: int, whisper_size: str = WHISPER_MODE
     })
 
     report(35, "Running speech transcription & word-level alignment (Whisper)...")
-    if use_whisperx and WHISPERX_AVAILABLE:
-        trans = transcribe_audio_whisperx(audio_path, whisper_size)
-    else:
-        trans = transcribe_audio(audio_path, whisper_size)
+    engine = "whisperx" if use_whisperx and WHISPERX_AVAILABLE else "faster-whisper"
+    file_digest = hashlib.sha256()
+    with open(audio_path, "rb") as audio_file:
+        for chunk in iter(lambda: audio_file.read(1024 * 1024), b""):
+            file_digest.update(chunk)
+    trans_key = (file_digest.hexdigest(), engine, whisper_size, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE)
+    def transcribe():
+        result = (transcribe_audio_whisperx(audio_path, whisper_size) if engine == "whisperx"
+                  else transcribe_audio(audio_path, whisper_size))
+        if not result["words"]:
+            raise ValueError("No speech was transcribed. Please use a clear speech recording and retry.")
+        return result
+    trans = _session_memo("transcription", trans_key, transcribe, refresh)
+    # Do not keep a fallback result for an optional engine that failed to load.
+    if engine == "whisperx" and trans.get("engine") != "whisperx":
+        st.session_state.pipeline_memo["transcription"].pop(trans_key, None)
 
+    if not trans["words"]:
+        raise ValueError("No speech was transcribed. Please use a clear speech recording and retry.")
     words, sentences = trans["words"], trans["sentences"]
 
     report(55, "Detecting stuttering events across 16 clinical categories...")
-    events = run_full_event_detection(words, sentences, acoustic, y, sr)
+    repeats = _session_memo("acoustic_repeats", audio_key,
+                            lambda: detect_repeated_sounds_acoustic(y, sr), refresh)
+    events = run_full_event_detection(words, sentences, acoustic, y, sr, repeats)
     events_df = pd.DataFrame(events) if events else pd.DataFrame(
         columns=["event_id", "event_type", "detected_text", "start_time", "end_time",
                  "duration", "confidence", "severity", "source"])
@@ -3106,8 +2562,7 @@ def page_analyze_session():
     
     render_header("Analyze Session", f"Patient: {p_name} | Session: {s_label} | Date: {s_date}")
     
-    # Primary Actions Bar
-    act_col1, act_col2, act_col3, act_col4 = st.columns(4)
+    # Result actions are shown after the execution controls.
     
     stats_row = db_get_statistics(session_id)
     events_df = db_get_events(session_id)
@@ -3124,50 +2579,50 @@ def page_analyze_session():
         "transcripts": dict(transcript_row) if transcript_row else {}
     }
     
-    act_col1.download_button(
-        "📥 Export Session JSON",
-        data=json.dumps(export_payload, indent=2, default=str),
-        file_name=f"session_{session_id}_clinical_analysis.json",
-        mime="application/json",
-        use_container_width=True
-    )
-    
-    if act_col2.button("📄 Clinical Report", use_container_width=True):
-        st.session_state.nav_page = "Clinical Report"
-        st.rerun()
-        
-    if act_col3.button("⚖️ Compare Session", use_container_width=True):
-        st.session_state.nav_page = "Patient History & Compare"
-        st.rerun()
-        
-    toggle_settings = act_col4.button("⚙️ Pipeline Settings", use_container_width=True)
-
     # Re-run & Model Settings Panel
-    with st.expander("⚙️ Analysis Pipeline Execution Settings", expanded=(session["status"] != "completed" or toggle_settings)):
+    with st.expander("Analysis settings · optional", expanded=False):
         c_mod1, c_mod2 = st.columns(2)
         whisper_size = c_mod1.selectbox("Whisper Model Size", ["tiny", "base", "small", "medium", "large-v3"],
                                         index=["tiny", "base", "small", "medium", "large-v3"].index(WHISPER_MODEL_SIZE)
                                         if WHISPER_MODEL_SIZE in ["tiny", "base", "small", "medium", "large-v3"] else 2)
         use_whisperx = c_mod2.checkbox("Use WhisperX phoneme alignment (if installed)", value=False, disabled=not WHISPERX_AVAILABLE)
         
+        refresh_analysis = st.checkbox("Recompute audio and transcription", value=False,
+                                       help="Bypass reusable results for this recording. Models and analysis settings stay the same.")
         if not FASTER_WHISPER_AVAILABLE:
             st.error("faster-whisper is not installed. Run `pip install faster-whisper` to enable transcription.")
 
-        if st.button("🔬 Execute / Re-run Full Clinical Pipeline Analysis", type="primary", disabled=not FASTER_WHISPER_AVAILABLE):
-            progress_bar = st.progress(0, text="Initiating speech analysis pipeline...")
-            def cb(pct, msg):
-                progress_bar.progress(min(100, int(pct)), text=msg)
-            try:
-                result = run_full_analysis_pipeline(session_id, whisper_size, use_whisperx, cb)
-                st.session_state.analysis_cache[session_id] = result
-                st.success(f"Analysis completed successfully! Fluency Score: {result['fluency_score']}/100 | Severity: {result['severity_label']}")
-                st.rerun()
-            except Exception as e:
-                render_error_state(
-                    title="Analysis Pipeline Could Not Be Completed",
-                    reason=f"The speech analysis engine encountered an execution error: {str(e)}",
-                    next_action="Verify audio signal format or try running with 'tiny' or 'base' Whisper model size."
-                )
+    with st.container(border=True):
+        action_context, action_run = st.columns([2, 1], vertical_alignment="center")
+        with action_context:
+            st.markdown("**Analysis complete**" if session["status"] == "completed" else "**Ready to process this recording**")
+            st.caption("Re-running replaces the saved analysis results." if session["status"] == "completed"
+                       else "Start the analysis, then review the results below.")
+        start_analysis = action_run.button(
+            "🔬 Re-run Analysis" if session["status"] == "completed" else "🔬 Start Analysis",
+            key="start_session_analysis", type="secondary" if session["status"] == "completed" else "primary",
+            use_container_width=True, disabled=not FASTER_WHISPER_AVAILABLE,
+        )
+    auto_start = st.session_state.pop("pending_analysis_id", None) == session_id
+    if (start_analysis or auto_start) and FASTER_WHISPER_AVAILABLE:
+        progress_bar = st.progress(0, text="Initiating speech analysis pipeline...")
+        def cb(pct, msg):
+            progress_bar.progress(min(100, int(pct)), text=msg)
+        db_update_session_status(session_id, "processing")
+        try:
+            result = run_full_analysis_pipeline(session_id, whisper_size, use_whisperx, cb, refresh=refresh_analysis)
+            st.session_state.analysis_cache[session_id] = result
+        except Exception as e:
+            db_update_session_status(session_id, "failed")
+            st.session_state.analysis_cache.pop(session_id, None)
+            render_error_state(
+                title="Analysis Pipeline Could Not Be Completed",
+                reason=str(e),
+                next_action="Check the recording and installed dependencies, then click Start Analysis to retry. The first run requires access to download the configured Whisper weights."
+            )
+            return
+        else:
+            st.rerun()
 
     if session["status"] != "completed":
         st.markdown("<br>", unsafe_allow_html=True)
@@ -3178,8 +2633,21 @@ def page_analyze_session():
             {"name": "16-Category Disfluency Event Detection", "status": "pending"},
             {"name": "%SS Rate & SSI-4 Severity Rating", "status": "pending"},
         ])
-        st.info("💡 Session analysis status: **PENDING**. Expand the pipeline settings above and click **Execute / Re-run Full Clinical Pipeline Analysis** to run processing.")
+        st.info("Click **Start Analysis** above to process this recording. Pipeline settings are optional.")
         return
+
+    with st.container(border=True):
+        st.caption("RESULTS & NEXT STEPS")
+        report_action, compare_action, export_action = st.columns(3)
+        if report_action.button("Open clinical report", type="primary", use_container_width=True):
+            st.session_state.nav_page = "Clinical Report"
+            st.rerun()
+        if compare_action.button("Compare sessions", use_container_width=True):
+            st.session_state.nav_page = "Patient History & Compare"
+            st.rerun()
+        export_action.download_button("Download session data", data=json.dumps(export_payload, indent=2, default=str),
+                                      file_name=f"session_{session_id}_clinical_analysis.json",
+                                      mime="application/json", use_container_width=True)
 
     # MAIN ANALYSIS AREA - 7 Core Sections
     stats = stats_row["stats"] if (stats_row and "stats" in stats_row) else {}
@@ -3363,8 +2831,8 @@ def page_analyze_session():
                 </div>
                 """, unsafe_allow_html=True)
 
-            if transcript_row["words_json"]:
-                words_list = json.loads(transcript_row["words_json"])
+            if transcript_row["word_timestamps_json"]:
+                words_list = json.loads(transcript_row["word_timestamps_json"])
                 if words_list:
                     st.markdown("<br>", unsafe_allow_html=True)
                     st.markdown('<div style="font-size: 13px; font-weight: 600; color: var(--text-secondary);">Word-Level Timing Alignment:</div>', unsafe_allow_html=True)
@@ -3844,7 +3312,7 @@ def page_clinical_report():
 
     # Clinical Actions Toolbar
     st.markdown('<div class="cs-section-title">Clinical Actions & Export</div>', unsafe_allow_html=True)
-    c_act1, c_act2, c_act3, c_act4 = st.columns(4)
+    c_act1, c_act2 = st.columns(2)
     
     prior_reports = db_get_reports(session_id)
     existing_doc_summary = ""
@@ -3886,8 +3354,7 @@ def page_clinical_report():
                            file_name=f"CVRET_Report_{p_code}_Session_{session_id}.json",
                            mime="application/json", use_container_width=True)
                            
-    c_act3.button("🖨️ Print Clinical View", use_container_width=True)
-    c_act4.button("📤 Share Document", use_container_width=True)
+    st.caption("Download the generated PDF to print or share the report.")
 
     if gen_pdf_click:
         if not REPORTLAB_AVAILABLE:
